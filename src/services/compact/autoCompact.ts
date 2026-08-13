@@ -59,10 +59,16 @@ export type AutoCompactTrackingState = {
   consecutiveFailures?: number
 }
 
-export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
-export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
-export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
-export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
+// Sized for a ~32K-token context window (roughly 1/6 of the ~200K window
+// these were originally calibrated against). At the original defaults,
+// warningThreshold/errorThreshold work out to effectiveContextWindow -
+// 33,000, which is negative for any window this small — the "context left"
+// warning would be permanently stuck on. Revisit if the model's context
+// window changes.
+export const AUTOCOMPACT_BUFFER_TOKENS = 2_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 2_500
+export const ERROR_THRESHOLD_BUFFER_TOKENS = 2_500
+export const MANUAL_COMPACT_BUFFER_TOKENS = 500
 
 // Stop trying autocompact after this many consecutive failures.
 // BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272)

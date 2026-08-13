@@ -38,7 +38,7 @@ export const TIME_BASED_MC_CLEARED_MESSAGE = '[Old tool result content cleared]'
 const IMAGE_MAX_TOKEN_SIZE = 2000
 
 // Only compact these tools
-const COMPACTABLE_TOOLS = new Set<string>([
+export const COMPACTABLE_TOOLS = new Set<string>([
   FILE_READ_TOOL_NAME,
   ...SHELL_TOOL_NAMES,
   GREP_TOOL_NAME,
@@ -135,7 +135,7 @@ export function resetMicrocompactState(): void {
 }
 
 // Helper to calculate tool result tokens
-function calculateToolResultTokens(block: ToolResultBlockParam): number {
+export function calculateToolResultTokens(block: ToolResultBlockParam): number {
   if (!block.content) {
     return 0
   }
@@ -221,9 +221,10 @@ export type MicrocompactResult = {
 
 /**
  * Walk messages and collect tool_use IDs whose tool name is in
- * COMPACTABLE_TOOLS, in encounter order. Shared by both microcompact paths.
+ * COMPACTABLE_TOOLS, in encounter order. Shared by both microcompact paths
+ * and by session-memory compaction's kept-tail pre-pass.
  */
-function collectCompactableToolIds(messages: Message[]): string[] {
+export function collectCompactableToolIds(messages: Message[]): string[] {
   const ids: string[] = []
   for (const message of messages) {
     if (
@@ -238,6 +239,43 @@ function collectCompactableToolIds(messages: Message[]): string[] {
     }
   }
   return ids
+}
+
+/**
+ * Replace tool_result content for the given tool_use IDs with the standard
+ * cleared-content marker. Extracted from the time-based microcompact pass so
+ * session-memory compaction's kept-tail pre-pass can apply the same clearing
+ * to a bounded message range instead of the whole conversation.
+ */
+export function clearToolResultsById(
+  messages: Message[],
+  clearSet: Set<string>,
+): { messages: Message[]; tokensSaved: number } {
+  let tokensSaved = 0
+  const result: Message[] = messages.map(message => {
+    if (message.type !== 'user' || !Array.isArray(message.message.content)) {
+      return message
+    }
+    let touched = false
+    const newContent = message.message.content.map(block => {
+      if (
+        block.type === 'tool_result' &&
+        clearSet.has(block.tool_use_id) &&
+        block.content !== TIME_BASED_MC_CLEARED_MESSAGE
+      ) {
+        tokensSaved += calculateToolResultTokens(block)
+        touched = true
+        return { ...block, content: TIME_BASED_MC_CLEARED_MESSAGE }
+      }
+      return block
+    })
+    if (!touched) return message
+    return {
+      ...message,
+      message: { ...message.message, content: newContent },
+    }
+  })
+  return { messages: result, tokensSaved }
 }
 
 // Prefix-match because promptCategory.ts sets the querySource to
@@ -466,30 +504,10 @@ function maybeTimeBasedMicrocompact(
     return null
   }
 
-  let tokensSaved = 0
-  const result: Message[] = messages.map(message => {
-    if (message.type !== 'user' || !Array.isArray(message.message.content)) {
-      return message
-    }
-    let touched = false
-    const newContent = message.message.content.map(block => {
-      if (
-        block.type === 'tool_result' &&
-        clearSet.has(block.tool_use_id) &&
-        block.content !== TIME_BASED_MC_CLEARED_MESSAGE
-      ) {
-        tokensSaved += calculateToolResultTokens(block)
-        touched = true
-        return { ...block, content: TIME_BASED_MC_CLEARED_MESSAGE }
-      }
-      return block
-    })
-    if (!touched) return message
-    return {
-      ...message,
-      message: { ...message.message, content: newContent },
-    }
-  })
+  const { messages: result, tokensSaved } = clearToolResultsById(
+    messages,
+    clearSet,
+  )
 
   if (tokensSaved === 0) {
     return null

@@ -120,14 +120,19 @@ import {
 } from './prompt.js'
 
 export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5
-export const POST_COMPACT_TOKEN_BUDGET = 50_000
-export const POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000
+// Sized for a ~32K-token context window. Kept deliberately conservative
+// (not a straight 1/6 proportional scale like the other buffers in this
+// file) — this budget is spent right after compaction specifically freed
+// up space, so over-budgeting reconstruction here risks an immediate
+// re-trigger or a prompt-too-long rejection on the very next turn.
+export const POST_COMPACT_TOKEN_BUDGET = 4_000
+export const POST_COMPACT_MAX_TOKENS_PER_FILE = 800
 // Skills can be large (verify=18.7KB, claude-api=20.1KB). Previously re-injected
 // unbounded on every compact → 5-10K tok/compact. Per-skill truncation beats
 // dropping — instructions at the top of a skill file are usually the critical
 // part. Budget sized to hold ~5 skills at the per-skill cap.
-export const POST_COMPACT_MAX_TOKENS_PER_SKILL = 5_000
-export const POST_COMPACT_SKILLS_TOKEN_BUDGET = 25_000
+export const POST_COMPACT_MAX_TOKENS_PER_SKILL = 600
+export const POST_COMPACT_SKILLS_TOKEN_BUDGET = 3_000
 const MAX_COMPACT_STREAMING_RETRIES = 2
 
 /**

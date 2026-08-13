@@ -38,7 +38,11 @@ import {
   type CompactionResult,
   createPlanAttachmentIfNeeded,
 } from './compact.js'
-import { estimateMessageTokens } from './microCompact.js'
+import {
+  clearToolResultsById,
+  collectCompactableToolIds,
+  estimateMessageTokens,
+} from './microCompact.js'
 import { getCompactUserSummaryMessage } from './prompt.js'
 
 /**
@@ -51,13 +55,26 @@ export type SessionMemoryCompactConfig = {
   minTextBlockMessages: number
   /** Maximum tokens to preserve after compaction (hard cap) */
   maxTokens: number
+  /** Number of most-recent compactable tool results within the candidate
+   *  keep-range to leave untouched. Older ones are cleared before the
+   *  keep-window is sized, so a handful of large tool outputs (big file
+   *  reads, large grep/bash output) can't inflate the window on bulk alone
+   *  — see calculateMessagesToKeepIndex. */
+  keepRecentToolResults: number
 }
 
 // Default configuration values (exported for use in tests)
+// Token values sized for a ~32K-token context window — the original
+// 10K/40K defaults were calibrated for a much larger (~200K) window;
+// 40K alone would exceed a 32K window entirely. minTextBlockMessages and
+// keepRecentToolResults are counts, not token budgets, but keepRecentToolResults
+// is trimmed too since a handful of large tool outputs can still dominate a
+// window this small.
 export const DEFAULT_SM_COMPACT_CONFIG: SessionMemoryCompactConfig = {
-  minTokens: 10_000,
+  minTokens: 1_600,
   minTextBlockMessages: 5,
-  maxTokens: 40_000,
+  maxTokens: 6_000,
+  keepRecentToolResults: 2,
 }
 
 // Current configuration (starts with defaults)
@@ -125,6 +142,11 @@ async function initSessionMemoryCompactConfig(): Promise<void> {
       remoteConfig.maxTokens && remoteConfig.maxTokens > 0
         ? remoteConfig.maxTokens
         : DEFAULT_SM_COMPACT_CONFIG.maxTokens,
+    keepRecentToolResults:
+      remoteConfig.keepRecentToolResults &&
+      remoteConfig.keepRecentToolResults > 0
+        ? remoteConfig.keepRecentToolResults
+        : DEFAULT_SM_COMPACT_CONFIG.keepRecentToolResults,
   }
   setSessionMemoryCompactConfig(config)
 }
@@ -565,18 +587,53 @@ export async function trySessionMemoryCompaction(
       logEvent('tengu_sm_compact_resumed_session', {})
     }
 
+    // Clear old tool results within the candidate range before sizing the
+    // keep-window. Without this, a handful of large tool outputs (big file
+    // reads, large grep/bash output) get swept into the kept tail at full
+    // size: hasTextBlocks() never counts tool_result blocks toward
+    // minTextBlockMessages, but estimateMessageTokens() counts them in full,
+    // so they inflate totalTokens without helping the walk below reach its
+    // stopping condition — pushing the kept tail toward maxTokens on
+    // tool-output bulk alone rather than genuine conversation length.
+    const candidateStart =
+      lastSummarizedIndex >= 0 ? lastSummarizedIndex + 1 : messages.length
+    const { keepRecentToolResults } = getSessionMemoryCompactConfig()
+    const candidateToolIds = collectCompactableToolIds(
+      messages.slice(candidateStart),
+    )
+    // Floor at 1: slice(-0) returns the full array (paradoxically keeps
+    // everything) rather than nothing — same footgun microCompact.ts guards
+    // against for its own keepRecent.
+    const keepRecentIdCount = Math.max(1, keepRecentToolResults)
+    const keepRecentToolIds = new Set(
+      candidateToolIds.slice(-keepRecentIdCount),
+    )
+    const clearToolIds = new Set(
+      candidateToolIds.filter(id => !keepRecentToolIds.has(id)),
+    )
+    let workingMessages = messages
+    if (clearToolIds.size > 0) {
+      const cleared = clearToolResultsById(messages, clearToolIds)
+      workingMessages = cleared.messages
+      logEvent('tengu_sm_compact_tool_result_clear', {
+        toolsCleared: clearToolIds.size,
+        toolsKept: keepRecentToolIds.size,
+        tokensSaved: cleared.tokensSaved,
+      })
+    }
+
     // Calculate the starting index for messages to keep
     // This starts from lastSummarizedIndex, expands to meet minimums,
     // and adjusts to not split tool_use/tool_result pairs
     const startIndex = calculateMessagesToKeepIndex(
-      messages,
+      workingMessages,
       lastSummarizedIndex,
     )
     // Filter out old compact boundary messages from messagesToKeep.
     // After REPL pruning, old boundaries re-yielded from messagesToKeep would
     // trigger an unwanted second prune (isCompactBoundaryMessage returns true),
     // discarding the new boundary and summary.
-    const messagesToKeep = messages
+    const messagesToKeep = workingMessages
       .slice(startIndex)
       .filter(m => !isCompactBoundaryMessage(m))
 

@@ -29,9 +29,13 @@ export type SessionMemoryConfig = {
 }
 
 // Default configuration values
+// Token thresholds sized for a ~32K-token context window (see
+// services/compact/autoCompact.ts and sessionMemoryCompact.ts for the same
+// rescaling). toolCallsBetweenUpdates is a count, not a token budget, so
+// it's left unchanged.
 export const DEFAULT_SESSION_MEMORY_CONFIG: SessionMemoryConfig = {
-  minimumMessageTokensToInit: 10000,
-  minimumTokensBetweenUpdate: 5000,
+  minimumMessageTokensToInit: 1600,
+  minimumTokensBetweenUpdate: 800,
   toolCallsBetweenUpdates: 3,
 }
 

@@ -5,8 +5,13 @@ import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { getErrnoCode, toError } from '../../utils/errors.js'
 import { logError } from '../../utils/log.js'
 
-const MAX_SECTION_LENGTH = 2000
-const MAX_TOTAL_SESSION_MEMORY_TOKENS = 12000
+// Sized for a ~32K-token context window; scaled down proportionally from
+// the original 2000/12000 (same ~1/6 ratio used elsewhere in the
+// compaction system for this window size). Keep MAX_SECTION_LENGTH at
+// roughly the same fraction of MAX_TOTAL_SESSION_MEMORY_TOKENS if either
+// changes again.
+const MAX_SECTION_LENGTH = 300
+const MAX_TOTAL_SESSION_MEMORY_TOKENS = 2000
 
 export const DEFAULT_SESSION_MEMORY_TEMPLATE = `
 # Session Title
