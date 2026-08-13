@@ -263,6 +263,26 @@ export function getSessionMemoryDir(): string {
 }
 
 /**
+ * Returns the precomputed compact-summary draft directory path for the
+ * current session with trailing separator. Nested under the project
+ * directory like session-memory/, so reads are already covered by
+ * isProjectDirPath() below — no separate permission check needed.
+ * Path format: {projectDir}/{sessionId}/compact-draft/
+ */
+export function getPrecomputedCompactDraftDir(): string {
+  return join(getProjectDir(getCwd()), getSessionId(), 'compact-draft') + sep
+}
+
+/**
+ * Returns the precomputed compact-summary draft file path for the current
+ * session.
+ * Path format: {projectDir}/{sessionId}/compact-draft/summary.md
+ */
+export function getPrecomputedCompactDraftPath(): string {
+  return join(getPrecomputedCompactDraftDir(), 'summary.md')
+}
+
+/**
  * Returns the session memory file path for the current session.
  * Path format: {projectDir}/{sessionId}/session-memory/summary.md
  */

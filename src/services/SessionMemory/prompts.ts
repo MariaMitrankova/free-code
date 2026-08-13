@@ -13,6 +13,45 @@ import { logError } from '../../utils/log.js'
 const MAX_SECTION_LENGTH = 300
 const MAX_TOTAL_SESSION_MEMORY_TOKENS = 2000
 
+// Precomputed compact-summary draft: a running draft of the SAME 9-section
+// structure the legacy full-compaction prompt (compact/prompt.ts's
+// BASE_COMPACT_PROMPT) asks the model to produce on-demand. Maintained
+// incrementally by the same background extraction call as the session
+// memory notes above, so that when session-memory-compact can't be used
+// (empty/missing/boundary not found/oversized), compaction can still splice
+// in this draft instead of falling all the way through to a blocking
+// full-summarization API call. Reuses the same header-based section
+// tooling (analyzeSectionSizes/generateSectionReminders/
+// truncateSessionMemoryForCompact) as the notes file below — the parsing
+// logic only cares about "# " headers, not which template it is.
+const DRAFT_MAX_TOTAL_TOKENS = 4000
+
+export const DEFAULT_COMPACT_DRAFT_TEMPLATE = `
+# Primary Request and Intent
+_All of the user's explicit requests and intents, in detail._
+
+# Key Technical Concepts
+_Important technical concepts, technologies, and frameworks discussed._
+
+# Files and Code Sections
+_Specific files and code sections examined, modified, or created. Why each is important, and the most relevant code snippets._
+
+# Errors and Fixes
+_Errors encountered and how they were fixed. Specific user feedback, especially where the user asked for something different._
+
+# Problem Solving
+_Problems solved and any ongoing troubleshooting efforts._
+
+# Pending Tasks
+_Tasks the user has explicitly asked to work on that are not yet done._
+
+# Current Work
+_Precisely what was being worked on immediately before now, including file names and code snippets where applicable._
+
+# Optional Next Step
+_The next step directly in line with the user's most recent explicit request and the task in progress. Include a verbatim quote showing exactly where things were left off. Leave blank if the last task concluded and no next step was confirmed with the user._
+`
+
 export const DEFAULT_SESSION_MEMORY_TEMPLATE = `
 # Session Title
 _A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_
@@ -164,13 +203,16 @@ function analyzeSectionSizes(content: string): Record<string, number> {
 }
 
 /**
- * Generate reminders for sections that are too long
+ * Generate reminders for sections that are too long. totalBudget defaults
+ * to the session-memory notes budget; pass DRAFT_MAX_TOTAL_TOKENS for the
+ * compact-draft file, which has its own (smaller) budget.
  */
 function generateSectionReminders(
   sectionSizes: Record<string, number>,
   totalTokens: number,
+  totalBudget: number = MAX_TOTAL_SESSION_MEMORY_TOKENS,
 ): string {
-  const overBudget = totalTokens > MAX_TOTAL_SESSION_MEMORY_TOKENS
+  const overBudget = totalTokens > totalBudget
   const oversizedSections = Object.entries(sectionSizes)
     .filter(([_, tokens]) => tokens > MAX_SECTION_LENGTH)
     .sort(([, a], [, b]) => b - a)
@@ -187,7 +229,7 @@ function generateSectionReminders(
 
   if (overBudget) {
     parts.push(
-      `\n\nCRITICAL: The session memory file is currently ~${totalTokens} tokens, which exceeds the maximum of ${MAX_TOTAL_SESSION_MEMORY_TOKENS} tokens. You MUST condense the file to fit within this budget. Aggressively shorten oversized sections by removing less important details, merging related items, and summarizing older entries. Prioritize keeping "Current State" and "Errors & Corrections" accurate and detailed.`,
+      `\n\nCRITICAL: This file is currently ~${totalTokens} tokens, which exceeds the maximum of ${totalBudget} tokens. You MUST condense it to fit within this budget. Aggressively shorten oversized sections by removing less important details, merging related items, and summarizing older entries. Prioritize keeping the most current/actionable sections accurate and detailed over older historical detail.`,
     )
   }
 
@@ -226,6 +268,68 @@ export async function isSessionMemoryEmpty(content: string): Promise<boolean> {
   const template = await loadSessionMemoryTemplate()
   // Compare trimmed content to detect if it's just the template
   return content.trim() === template.trim()
+}
+
+/**
+ * Check if the precomputed compact-draft content is essentially empty
+ * (matches the template, i.e. no actual extraction has happened yet).
+ */
+export function isCompactDraftEmpty(content: string): boolean {
+  return content.trim() === DEFAULT_COMPACT_DRAFT_TEMPLATE.trim()
+}
+
+/**
+ * Instructions appended to the session-memory update prompt telling the
+ * extraction agent to ALSO update the compact-draft file in the same
+ * forked-agent call (same Edit-tool batch, same structure-preservation
+ * rules) — avoids a second background LLM call for a second artifact.
+ * Only used by the automatic background hook (extractSessionMemory); the
+ * manual /summary path still updates session-memory notes only.
+ */
+function getCompactDraftUpdateInstructions(): string {
+  return `
+
+Additionally, use the Edit tool (in the same parallel batch as above) to update a SECOND file: the compact-summary draft. It has already been read for you. Here are its current contents:
+<current_compact_draft_content>
+{{currentDraft}}
+</current_compact_draft_content>
+
+The SAME editing rules apply to this file: preserve section headers and italic _section descriptions_ exactly as-is, only edit the content below them, don't add or remove sections, keep each section under ~${MAX_SECTION_LENGTH} tokens/words, and don't reference these instructions in the content. This file mirrors the structure of a full conversation summary (primary request, key files, errors, pending/current work) rather than freeform notes — write it as such.
+
+Use the Edit tool with file_path: {{draftPath}}`
+}
+
+/**
+ * Build the combined extraction prompt: the normal session-memory update
+ * prompt plus instructions to update the compact-draft file in the same
+ * call. Both files' section-size reminders are generated the same way
+ * (analyzeSectionSizes/generateSectionReminders are content-agnostic).
+ */
+export async function buildCombinedExtractionPrompt(
+  currentNotes: string,
+  notesPath: string,
+  currentDraft: string,
+  draftPath: string,
+): Promise<string> {
+  const notesPrompt = await buildSessionMemoryUpdatePrompt(
+    currentNotes,
+    notesPath,
+  )
+
+  const draftSectionSizes = analyzeSectionSizes(currentDraft)
+  const draftTotalTokens = roughTokenCountEstimation(currentDraft)
+  const draftReminders = generateSectionReminders(
+    draftSectionSizes,
+    draftTotalTokens,
+    DRAFT_MAX_TOTAL_TOKENS,
+  )
+
+  const draftInstructions = substituteVariables(
+    getCompactDraftUpdateInstructions(),
+    { currentDraft, draftPath },
+  )
+
+  return notesPrompt + draftInstructions + draftReminders
 }
 
 export async function buildSessionMemoryUpdatePrompt(

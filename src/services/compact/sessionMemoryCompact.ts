@@ -13,7 +13,10 @@ import {
   isCompactBoundaryMessage,
 } from '../../utils/messages.js'
 import { getMainLoopModel } from '../../utils/model/model.js'
-import { getSessionMemoryPath } from '../../utils/permissions/filesystem.js'
+import {
+  getPrecomputedCompactDraftPath,
+  getSessionMemoryPath,
+} from '../../utils/permissions/filesystem.js'
 import { processSessionStartHooks } from '../../utils/sessionStart.js'
 import { getTranscriptPath } from '../../utils/sessionStorage.js'
 import { tokenCountFromLastAPIResponse } from '../../utils/tokens.js'
@@ -24,11 +27,13 @@ import {
 } from '../analytics/growthbook.js'
 import { logEvent } from '../analytics/index.js'
 import {
+  isCompactDraftEmpty,
   isSessionMemoryEmpty,
   truncateSessionMemoryForCompact,
 } from '../SessionMemory/prompts.js'
 import {
   getLastSummarizedMessageId,
+  getPrecomputedCompactDraftContent,
   getSessionMemoryContent,
   waitForSessionMemoryExtraction,
 } from '../SessionMemory/sessionMemoryUtils.js'
@@ -56,11 +61,19 @@ export type SessionMemoryCompactConfig = {
   /** Maximum tokens to preserve after compaction (hard cap) */
   maxTokens: number
   /** Number of most-recent compactable tool results within the candidate
-   *  keep-range to leave untouched. Older ones are cleared before the
-   *  keep-window is sized, so a handful of large tool outputs (big file
-   *  reads, large grep/bash output) can't inflate the window on bulk alone
-   *  — see calculateMessagesToKeepIndex. */
+   *  keep-range to leave untouched when enableOldToolResultClearing is on.
+   *  Older ones are cleared before the keep-window is sized, so a handful
+   *  of large tool outputs (big file reads, large grep/bash output) can't
+   *  inflate the window on bulk alone — see calculateMessagesToKeepIndex.
+   *  Unused when enableOldToolResultClearing is false. */
   keepRecentToolResults: number
+  /** Whether to clear old (non-recent) compactable tool results before
+   *  sizing the keep-window at all. This is a real, lossy tradeoff — the
+   *  cleared content isn't recoverable except by re-running the tool (safe
+   *  for idempotent tools like Read/Grep, riskier for non-reproducible ones
+   *  like Bash) — so it defaults off. Flip on to trade some fidelity for a
+   *  smaller kept-tail / less downstream context growth. */
+  enableOldToolResultClearing: boolean
 }
 
 // Default configuration values (exported for use in tests)
@@ -75,6 +88,7 @@ export const DEFAULT_SM_COMPACT_CONFIG: SessionMemoryCompactConfig = {
   minTextBlockMessages: 5,
   maxTokens: 6_000,
   keepRecentToolResults: 2,
+  enableOldToolResultClearing: false,
 }
 
 // Current configuration (starts with defaults)
@@ -147,6 +161,11 @@ async function initSessionMemoryCompactConfig(): Promise<void> {
       remoteConfig.keepRecentToolResults > 0
         ? remoteConfig.keepRecentToolResults
         : DEFAULT_SM_COMPACT_CONFIG.keepRecentToolResults,
+    // Boolean, not a positive-number check like the fields above.
+    enableOldToolResultClearing:
+      typeof remoteConfig.enableOldToolResultClearing === 'boolean'
+        ? remoteConfig.enableOldToolResultClearing
+        : DEFAULT_SM_COMPACT_CONFIG.enableOldToolResultClearing,
   }
   setSessionMemoryCompactConfig(config)
 }
@@ -454,11 +473,49 @@ export function shouldUseSessionMemoryCompaction(): boolean {
 }
 
 /**
- * Create a CompactionResult from session memory
+ * Check if we should use the precomputed compact-draft — a running draft
+ * of the legacy 9-section summary format (see
+ * SessionMemory/prompts.ts's DEFAULT_COMPACT_DRAFT_TEMPLATE), maintained
+ * by the SAME background extraction call as session memory (see
+ * SessionMemory/sessionMemory.ts). Tried after trySessionMemoryCompaction
+ * bails, before falling through to a blocking full-summarization call.
+ *
+ * Opt-in only for now via env var: this is newer and less-proven than
+ * session-memory compaction, and there's no GrowthBook flag for it yet.
  */
-function createCompactionResultFromSessionMemory(
+export function shouldUsePrecomputedSummaryCompaction(): boolean {
+  if (isEnvTruthy(process.env.ENABLE_CLAUDE_CODE_PRECOMPUTED_COMPACT)) {
+    return true
+  }
+  if (isEnvTruthy(process.env.DISABLE_CLAUDE_CODE_PRECOMPUTED_COMPACT)) {
+    return false
+  }
+  return false
+}
+
+/** Telemetry event names for one artifact type (session-memory notes vs.
+ *  the precomputed compact-draft), threaded through tryArtifactCompaction
+ *  so each artifact keeps its own distinguishable events. */
+type ArtifactCompactionEvents = {
+  noContent: string
+  emptyTemplate: string
+  summarizedIdNotFound: string
+  resumedSession: string
+  toolResultClear: string
+  thresholdExceeded: string
+  error: string
+}
+
+/**
+ * Create a CompactionResult from a precomputed artifact's content. Shared
+ * by session memory and the compact-draft — both are plain markdown with
+ * "# " section headers, spliced in as the summary the same way regardless
+ * of which one produced the content.
+ */
+function createCompactionResultFromArtifact(
   messages: Message[],
-  sessionMemory: string,
+  artifactContent: string,
+  artifactPath: string,
   messagesToKeep: Message[],
   hookResults: HookResultMessage[],
   transcriptPath: string,
@@ -478,10 +535,12 @@ function createCompactionResultFromSessionMemory(
     ].sort()
   }
 
-  // Truncate oversized sections to prevent session memory from consuming
-  // the entire post-compact token budget
+  // Truncate oversized sections to prevent the artifact from consuming
+  // the entire post-compact token budget. truncateSessionMemoryForCompact
+  // only parses "# " section headers, so it works for either artifact's
+  // content regardless of the name.
   const { truncatedContent, wasTruncated } =
-    truncateSessionMemoryForCompact(sessionMemory)
+    truncateSessionMemoryForCompact(artifactContent)
 
   let summaryContent = getCompactUserSummaryMessage(
     truncatedContent,
@@ -491,8 +550,7 @@ function createCompactionResultFromSessionMemory(
   )
 
   if (wasTruncated) {
-    const memoryPath = getSessionMemoryPath()
-    summaryContent += `\n\nSome session memory sections were truncated for length. The full session memory can be viewed at: ${memoryPath}`
+    summaryContent += `\n\nSome sections were truncated for length. The full content can be viewed at: ${artifactPath}`
   }
 
   const summaryMessages = [
@@ -517,50 +575,58 @@ function createCompactionResultFromSessionMemory(
     hookResults,
     messagesToKeep,
     preCompactTokenCount,
-    // SM-compact has no compact-API-call, so postCompactTokenCount (kept for
-    // event continuity) and truePostCompactTokenCount converge to the same value.
+    // Artifact-based compaction has no compact-API-call, so
+    // postCompactTokenCount (kept for event continuity) and
+    // truePostCompactTokenCount converge to the same value.
     postCompactTokenCount: estimateMessageTokens(summaryMessages),
     truePostCompactTokenCount: estimateMessageTokens(summaryMessages),
   }
 }
 
 /**
- * Try to use session memory for compaction instead of traditional compaction.
- * Returns null if session memory compaction cannot be used.
+ * Shared core for compacting against a precomputed artifact (session-memory
+ * notes or the compact-draft). Both share the same lastSummarizedMessageId
+ * cursor (updated by the same background extraction call — see
+ * SessionMemory/sessionMemory.ts), so the "how much recent history to keep
+ * verbatim" logic is identical between them; only the content source, the
+ * emptiness check, and telemetry event names differ.
  *
  * Handles two scenarios:
  * 1. Normal case: lastSummarizedMessageId is set, keep only messages after that ID
- * 2. Resumed session: lastSummarizedMessageId is not set but session memory has content,
- *    keep all messages but use session memory as the summary
+ * 2. Resumed session: lastSummarizedMessageId is not set but the artifact has
+ *    content, keep all messages but use the artifact as the summary
+ *
+ * Returns null if the artifact can't be used for this compaction, in which
+ * case the caller should fall through to the next-cheapest option.
  */
-export async function trySessionMemoryCompaction(
+async function tryArtifactCompaction(
   messages: Message[],
+  getContent: () => Promise<string | null>,
+  isEmpty: (content: string) => Promise<boolean> | boolean,
+  artifactPath: string,
+  events: ArtifactCompactionEvents,
   agentId?: AgentId,
   autoCompactThreshold?: number,
 ): Promise<CompactionResult | null> {
-  if (!shouldUseSessionMemoryCompaction()) {
-    return null
-  }
-
   // Initialize config from remote (only fetches once)
   await initSessionMemoryCompactConfig()
 
-  // Wait for any in-progress session memory extraction to complete (with timeout)
+  // Wait for any in-progress background extraction to complete (with timeout)
   await waitForSessionMemoryExtraction()
 
   const lastSummarizedMessageId = getLastSummarizedMessageId()
-  const sessionMemory = await getSessionMemoryContent()
+  const content = await getContent()
 
-  // No session memory file exists at all
-  if (!sessionMemory) {
-    logEvent('tengu_sm_compact_no_session_memory', {})
+  // No artifact file exists at all
+  if (!content) {
+    logEvent(events.noContent, {})
     return null
   }
 
-  // Session memory exists but matches the template (no actual content extracted)
-  // Fall back to legacy compact behavior
-  if (await isSessionMemoryEmpty(sessionMemory)) {
-    logEvent('tengu_sm_compact_empty_template', {})
+  // Artifact exists but matches the template (no actual content extracted)
+  // Fall back to the next-cheapest option
+  if (await isEmpty(content)) {
+    logEvent(events.emptyTemplate, {})
     return null
   }
 
@@ -575,51 +641,57 @@ export async function trySessionMemoryCompaction(
 
       if (lastSummarizedIndex === -1) {
         // The summarized message ID doesn't exist in current messages
-        // This can happen if messages were modified - fall back to legacy compact
+        // This can happen if messages were modified - fall back
         // since we can't determine the boundary between summarized and unsummarized messages
-        logEvent('tengu_sm_compact_summarized_id_not_found', {})
+        logEvent(events.summarizedIdNotFound, {})
         return null
       }
     } else {
-      // Resumed session case: session memory has content but we don't know the boundary
+      // Resumed session case: the artifact has content but we don't know the boundary
       // Set lastSummarizedIndex to last message so startIndex becomes messages.length (no messages kept initially)
       lastSummarizedIndex = messages.length - 1
-      logEvent('tengu_sm_compact_resumed_session', {})
+      logEvent(events.resumedSession, {})
     }
 
     // Clear old tool results within the candidate range before sizing the
-    // keep-window. Without this, a handful of large tool outputs (big file
-    // reads, large grep/bash output) get swept into the kept tail at full
-    // size: hasTextBlocks() never counts tool_result blocks toward
-    // minTextBlockMessages, but estimateMessageTokens() counts them in full,
-    // so they inflate totalTokens without helping the walk below reach its
-    // stopping condition — pushing the kept tail toward maxTokens on
-    // tool-output bulk alone rather than genuine conversation length.
+    // keep-window — OFF by default (enableOldToolResultClearing), since
+    // it's a lossy operation: cleared content isn't recoverable except by
+    // re-running the tool. When on: without this, a handful of large tool
+    // outputs (big file reads, large grep/bash output) get swept into the
+    // kept tail at full size — hasTextBlocks() never counts tool_result
+    // blocks toward minTextBlockMessages, but estimateMessageTokens()
+    // counts them in full, so they inflate totalTokens without helping the
+    // walk below reach its stopping condition — pushing the kept tail
+    // toward maxTokens on tool-output bulk alone rather than genuine
+    // conversation length.
     const candidateStart =
       lastSummarizedIndex >= 0 ? lastSummarizedIndex + 1 : messages.length
-    const { keepRecentToolResults } = getSessionMemoryCompactConfig()
-    const candidateToolIds = collectCompactableToolIds(
-      messages.slice(candidateStart),
-    )
-    // Floor at 1: slice(-0) returns the full array (paradoxically keeps
-    // everything) rather than nothing — same footgun microCompact.ts guards
-    // against for its own keepRecent.
-    const keepRecentIdCount = Math.max(1, keepRecentToolResults)
-    const keepRecentToolIds = new Set(
-      candidateToolIds.slice(-keepRecentIdCount),
-    )
-    const clearToolIds = new Set(
-      candidateToolIds.filter(id => !keepRecentToolIds.has(id)),
-    )
+    const { keepRecentToolResults, enableOldToolResultClearing } =
+      getSessionMemoryCompactConfig()
     let workingMessages = messages
-    if (clearToolIds.size > 0) {
-      const cleared = clearToolResultsById(messages, clearToolIds)
-      workingMessages = cleared.messages
-      logEvent('tengu_sm_compact_tool_result_clear', {
-        toolsCleared: clearToolIds.size,
-        toolsKept: keepRecentToolIds.size,
-        tokensSaved: cleared.tokensSaved,
-      })
+    if (enableOldToolResultClearing) {
+      const candidateToolIds = collectCompactableToolIds(
+        messages.slice(candidateStart),
+      )
+      // Floor at 1: slice(-0) returns the full array (paradoxically keeps
+      // everything) rather than nothing — same footgun microCompact.ts
+      // guards against for its own keepRecent.
+      const keepRecentIdCount = Math.max(1, keepRecentToolResults)
+      const keepRecentToolIds = new Set(
+        candidateToolIds.slice(-keepRecentIdCount),
+      )
+      const clearToolIds = new Set(
+        candidateToolIds.filter(id => !keepRecentToolIds.has(id)),
+      )
+      if (clearToolIds.size > 0) {
+        const cleared = clearToolResultsById(messages, clearToolIds)
+        workingMessages = cleared.messages
+        logEvent(events.toolResultClear, {
+          toolsCleared: clearToolIds.size,
+          toolsKept: keepRecentToolIds.size,
+          tokensSaved: cleared.tokensSaved,
+        })
+      }
     }
 
     // Calculate the starting index for messages to keep
@@ -645,9 +717,10 @@ export async function trySessionMemoryCompaction(
     // Get transcript path for the summary message
     const transcriptPath = getTranscriptPath()
 
-    const compactionResult = createCompactionResultFromSessionMemory(
+    const compactionResult = createCompactionResultFromArtifact(
       messages,
-      sessionMemory,
+      content,
+      artifactPath,
       messagesToKeep,
       hookResults,
       transcriptPath,
@@ -663,7 +736,7 @@ export async function trySessionMemoryCompaction(
       autoCompactThreshold !== undefined &&
       postCompactTokenCount >= autoCompactThreshold
     ) {
-      logEvent('tengu_sm_compact_threshold_exceeded', {
+      logEvent(events.thresholdExceeded, {
         postCompactTokenCount,
         autoCompactThreshold,
       })
@@ -678,10 +751,78 @@ export async function trySessionMemoryCompaction(
   } catch (error) {
     // Use logEvent instead of logError since errors here are expected
     // (e.g., file not found, path issues) and shouldn't go to error logs
-    logEvent('tengu_sm_compact_error', {})
+    logEvent(events.error, {})
     if (process.env.USER_TYPE === 'ant') {
-      logForDebugging(`Session memory compaction error: ${errorMessage(error)}`)
+      logForDebugging(`Artifact compaction error: ${errorMessage(error)}`)
     }
     return null
   }
+}
+
+const SESSION_MEMORY_EVENTS: ArtifactCompactionEvents = {
+  noContent: 'tengu_sm_compact_no_session_memory',
+  emptyTemplate: 'tengu_sm_compact_empty_template',
+  summarizedIdNotFound: 'tengu_sm_compact_summarized_id_not_found',
+  resumedSession: 'tengu_sm_compact_resumed_session',
+  toolResultClear: 'tengu_sm_compact_tool_result_clear',
+  thresholdExceeded: 'tengu_sm_compact_threshold_exceeded',
+  error: 'tengu_sm_compact_error',
+}
+
+const PRECOMPUTED_SUMMARY_EVENTS: ArtifactCompactionEvents = {
+  noContent: 'tengu_precomputed_compact_no_draft',
+  emptyTemplate: 'tengu_precomputed_compact_empty_template',
+  summarizedIdNotFound: 'tengu_precomputed_compact_summarized_id_not_found',
+  resumedSession: 'tengu_precomputed_compact_resumed_session',
+  toolResultClear: 'tengu_precomputed_compact_tool_result_clear',
+  thresholdExceeded: 'tengu_precomputed_compact_threshold_exceeded',
+  error: 'tengu_precomputed_compact_error',
+}
+
+/**
+ * Try to use session memory for compaction instead of traditional compaction.
+ * Returns null if session memory compaction cannot be used.
+ */
+export async function trySessionMemoryCompaction(
+  messages: Message[],
+  agentId?: AgentId,
+  autoCompactThreshold?: number,
+): Promise<CompactionResult | null> {
+  if (!shouldUseSessionMemoryCompaction()) {
+    return null
+  }
+  return tryArtifactCompaction(
+    messages,
+    getSessionMemoryContent,
+    isSessionMemoryEmpty,
+    getSessionMemoryPath(),
+    SESSION_MEMORY_EVENTS,
+    agentId,
+    autoCompactThreshold,
+  )
+}
+
+/**
+ * Try to use the precomputed compact-draft instead of session memory or a
+ * blocking full-summarization call. Intended to be tried after
+ * trySessionMemoryCompaction bails — see autoCompact.ts and
+ * commands/compact/compact.ts for the fallback order.
+ */
+export async function tryPrecomputedSummaryCompaction(
+  messages: Message[],
+  agentId?: AgentId,
+  autoCompactThreshold?: number,
+): Promise<CompactionResult | null> {
+  if (!shouldUsePrecomputedSummaryCompaction()) {
+    return null
+  }
+  return tryArtifactCompaction(
+    messages,
+    getPrecomputedCompactDraftContent,
+    isCompactDraftEmpty,
+    getPrecomputedCompactDraftPath(),
+    PRECOMPUTED_SUMMARY_EVENTS,
+    agentId,
+    autoCompactThreshold,
+  )
 }

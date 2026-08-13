@@ -23,7 +23,10 @@ import {
   type RecompactionInfo,
 } from './compact.js'
 import { runPostCompactCleanup } from './postCompactCleanup.js'
-import { trySessionMemoryCompaction } from './sessionMemoryCompact.js'
+import {
+  tryPrecomputedSummaryCompaction,
+  trySessionMemoryCompaction,
+} from './sessionMemoryCompact.js'
 
 // Reserve this many tokens for output during compaction
 // Based on p99.99 of compact summary output being 17,387 tokens.
@@ -312,6 +315,28 @@ export async function autoCompactIfNeeded(
     return {
       wasCompacted: true,
       compactionResult: sessionMemoryResult,
+    }
+  }
+
+  // EXPERIMENT: Try the precomputed compact-draft next, before falling all
+  // the way through to a blocking full-summarization call. Same success
+  // handling as session-memory compaction above — it produces the same
+  // shape of CompactionResult via the shared splice logic.
+  const precomputedSummaryResult = await tryPrecomputedSummaryCompaction(
+    messages,
+    toolUseContext.agentId,
+    recompactionInfo.autoCompactThreshold,
+  )
+  if (precomputedSummaryResult) {
+    setLastSummarizedMessageId(undefined)
+    runPostCompactCleanup(querySource)
+    if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
+      notifyCompaction(querySource ?? 'compact', toolUseContext.agentId)
+    }
+    markPostCompaction()
+    return {
+      wasCompacted: true,
+      compactionResult: precomputedSummaryResult,
     }
   }
 

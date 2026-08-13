@@ -16,7 +16,10 @@ import {
 import { suppressCompactWarning } from '../../services/compact/compactWarningState.js'
 import { microcompactMessages } from '../../services/compact/microCompact.js'
 import { runPostCompactCleanup } from '../../services/compact/postCompactCleanup.js'
-import { trySessionMemoryCompaction } from '../../services/compact/sessionMemoryCompact.js'
+import {
+  tryPrecomputedSummaryCompaction,
+  trySessionMemoryCompaction,
+} from '../../services/compact/sessionMemoryCompact.js'
 import { setLastSummarizedMessageId } from '../../services/SessionMemory/sessionMemoryUtils.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { LocalCommandCall } from '../../types/command.js'
@@ -77,6 +80,31 @@ export const call: LocalCommandCall = async (args, context) => {
         return {
           type: 'compact',
           compactionResult: sessionMemoryResult,
+          displayText: buildDisplayText(context),
+        }
+      }
+
+      // EXPERIMENT: precomputed compact-draft, tried next (also doesn't
+      // support custom instructions — it's a splice, not a fresh LLM call).
+      const precomputedSummaryResult = await tryPrecomputedSummaryCompaction(
+        messages,
+        context.agentId,
+      )
+      if (precomputedSummaryResult) {
+        getUserContext.cache.clear?.()
+        runPostCompactCleanup()
+        if (feature('PROMPT_CACHE_BREAK_DETECTION')) {
+          notifyCompaction(
+            context.options.querySource ?? 'compact',
+            context.agentId,
+          )
+        }
+        markPostCompaction()
+        suppressCompactWarning()
+
+        return {
+          type: 'compact',
+          compactionResult: precomputedSummaryResult,
           displayText: buildDisplayText(context),
         }
       }

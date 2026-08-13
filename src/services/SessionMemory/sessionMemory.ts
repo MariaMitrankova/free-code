@@ -33,6 +33,8 @@ import {
   hasToolCallsInLastAssistantTurn,
 } from '../../utils/messages.js'
 import {
+  getPrecomputedCompactDraftDir,
+  getPrecomputedCompactDraftPath,
   getSessionMemoryDir,
   getSessionMemoryPath,
 } from '../../utils/permissions/filesystem.js'
@@ -42,7 +44,9 @@ import { getTokenUsage, tokenCountWithEstimation } from '../../utils/tokens.js'
 import { logEvent } from '../analytics/index.js'
 import { isAutoCompactEnabled } from '../compact/autoCompact.js'
 import {
+  buildCombinedExtractionPrompt,
   buildSessionMemoryUpdatePrompt,
+  DEFAULT_COMPACT_DRAFT_TEMPLATE,
   loadSessionMemoryTemplate,
 } from './prompts.js'
 import {
@@ -180,27 +184,31 @@ export function shouldExtractMemory(messages: Message[]): boolean {
   return false
 }
 
-async function setupSessionMemoryFile(
+/**
+ * Create a markdown artifact file (with its starting template) if it
+ * doesn't exist yet, then read its current content. Shared by session
+ * memory notes and the precomputed compact-draft — same create/read
+ * semantics, different directory/path/template/log event.
+ */
+async function setupMarkdownArtifactFile(
+  dir: string,
+  filePath: string,
+  template: string,
   toolUseContext: ToolUseContext,
-): Promise<{ memoryPath: string; currentMemory: string }> {
+  logEventName: string,
+): Promise<string> {
   const fs = getFsImplementation()
+  await fs.mkdir(dir, { mode: 0o700 })
 
-  // Set up directory and file
-  const sessionMemoryDir = getSessionMemoryDir()
-  await fs.mkdir(sessionMemoryDir, { mode: 0o700 })
-
-  const memoryPath = getSessionMemoryPath()
-
-  // Create the memory file if it doesn't exist (wx = O_CREAT|O_EXCL)
+  // Create the file if it doesn't exist (wx = O_CREAT|O_EXCL)
   try {
-    await writeFile(memoryPath, '', {
+    await writeFile(filePath, '', {
       encoding: 'utf-8',
       mode: 0o600,
       flag: 'wx',
     })
-    // Only load template if file was just created
-    const template = await loadSessionMemoryTemplate()
-    await writeFile(memoryPath, template, {
+    // Only write the template if the file was just created
+    await writeFile(filePath, template, {
       encoding: 'utf-8',
       mode: 0o600,
     })
@@ -213,23 +221,50 @@ async function setupSessionMemoryFile(
 
   // Drop any cached entry so FileReadTool's dedup doesn't return a
   // file_unchanged stub — we need the actual content. The Read repopulates it.
-  toolUseContext.readFileState.delete(memoryPath)
+  toolUseContext.readFileState.delete(filePath)
   const result = await FileReadTool.call(
-    { file_path: memoryPath },
+    { file_path: filePath },
     toolUseContext,
   )
-  let currentMemory = ''
+  let content = ''
 
   const output = result.data as FileReadToolOutput
   if (output.type === 'text') {
-    currentMemory = output.file.content
+    content = output.file.content
   }
 
-  logEvent('tengu_session_memory_file_read', {
-    content_length: currentMemory.length,
-  })
+  logEvent(logEventName, { content_length: content.length })
 
+  return content
+}
+
+async function setupSessionMemoryFile(
+  toolUseContext: ToolUseContext,
+): Promise<{ memoryPath: string; currentMemory: string }> {
+  const memoryPath = getSessionMemoryPath()
+  const template = await loadSessionMemoryTemplate()
+  const currentMemory = await setupMarkdownArtifactFile(
+    getSessionMemoryDir(),
+    memoryPath,
+    template,
+    toolUseContext,
+    'tengu_session_memory_file_read',
+  )
   return { memoryPath, currentMemory }
+}
+
+async function setupCompactDraftFile(
+  toolUseContext: ToolUseContext,
+): Promise<{ draftPath: string; currentDraft: string }> {
+  const draftPath = getPrecomputedCompactDraftPath()
+  const currentDraft = await setupMarkdownArtifactFile(
+    getPrecomputedCompactDraftDir(),
+    draftPath,
+    DEFAULT_COMPACT_DRAFT_TEMPLATE,
+    toolUseContext,
+    'tengu_compact_draft_file_read',
+  )
+  return { draftPath, currentDraft }
 }
 
 /**
@@ -302,23 +337,31 @@ const extractSessionMemory = sequential(async function (
   // Create isolated context for setup to avoid polluting parent's cache
   const setupContext = createSubagentContext(toolUseContext)
 
-  // Set up file system and read current state with isolated context
-  const { memoryPath, currentMemory } =
-    await setupSessionMemoryFile(setupContext)
+  // Set up both artifact files and read current state with isolated context.
+  // The compact-draft file is updated in the SAME extraction call as the
+  // session-memory notes below — one forked-agent call producing two
+  // artifacts, rather than a second background LLM call.
+  const [{ memoryPath, currentMemory }, { draftPath, currentDraft }] =
+    await Promise.all([
+      setupSessionMemoryFile(setupContext),
+      setupCompactDraftFile(setupContext),
+    ])
 
-  // Create extraction message
-  const userPrompt = await buildSessionMemoryUpdatePrompt(
+  // Create the combined extraction message (notes update + draft update)
+  const userPrompt = await buildCombinedExtractionPrompt(
     currentMemory,
     memoryPath,
+    currentDraft,
+    draftPath,
   )
 
-  // Run session memory extraction using runForkedAgent for prompt caching
+  // Run extraction using runForkedAgent for prompt caching
   // runForkedAgent creates an isolated context to prevent mutation of parent state
-  // Pass setupContext.readFileState so the forked agent can edit the memory file
+  // Pass setupContext.readFileState so the forked agent can edit both files
   await runForkedAgent({
     promptMessages: [createUserMessage({ content: userPrompt })],
     cacheSafeParams: createCacheSafeParams(context),
-    canUseTool: createMemoryFileCanUseTool(memoryPath),
+    canUseTool: createMultiFileCanUseTool([memoryPath, draftPath]),
     querySource: 'session_memory',
     forkLabel: 'session_memory',
     overrides: { readFileState: setupContext.readFileState },
@@ -458,6 +501,15 @@ export async function manuallyExtractSessionMemory(
  * Creates a canUseTool function that only allows Edit for the exact memory file.
  */
 export function createMemoryFileCanUseTool(memoryPath: string): CanUseToolFn {
+  return createMultiFileCanUseTool([memoryPath])
+}
+
+/**
+ * Creates a canUseTool function that only allows Edit for the given set of
+ * file paths. Used by the background extraction hook, which updates both
+ * the session-memory notes file and the compact-draft file in one call.
+ */
+function createMultiFileCanUseTool(allowedPaths: string[]): CanUseToolFn {
   return async (tool: Tool, input: unknown) => {
     if (
       tool.name === FILE_EDIT_TOOL_NAME &&
@@ -466,16 +518,16 @@ export function createMemoryFileCanUseTool(memoryPath: string): CanUseToolFn {
       'file_path' in input
     ) {
       const filePath = input.file_path
-      if (typeof filePath === 'string' && filePath === memoryPath) {
+      if (typeof filePath === 'string' && allowedPaths.includes(filePath)) {
         return { behavior: 'allow' as const, updatedInput: input }
       }
     }
     return {
       behavior: 'deny' as const,
-      message: `only ${FILE_EDIT_TOOL_NAME} on ${memoryPath} is allowed`,
+      message: `only ${FILE_EDIT_TOOL_NAME} on ${allowedPaths.join(' or ')} is allowed`,
       decisionReason: {
         type: 'other' as const,
-        reason: `only ${FILE_EDIT_TOOL_NAME} on ${memoryPath} is allowed`,
+        reason: `only ${FILE_EDIT_TOOL_NAME} on ${allowedPaths.join(' or ')} is allowed`,
       },
     }
   }

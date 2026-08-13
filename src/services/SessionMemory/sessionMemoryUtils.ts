@@ -5,7 +5,10 @@
 
 import { isFsInaccessible } from '../../utils/errors.js'
 import { getFsImplementation } from '../../utils/fsOperations.js'
-import { getSessionMemoryPath } from '../../utils/permissions/filesystem.js'
+import {
+  getPrecomputedCompactDraftPath,
+  getSessionMemoryPath,
+} from '../../utils/permissions/filesystem.js'
 import { sleep } from '../../utils/sleep.js'
 import { logEvent } from '../analytics/index.js'
 
@@ -119,6 +122,31 @@ export async function getSessionMemoryContent(): Promise<string | null> {
     const content = await fs.readFile(memoryPath, { encoding: 'utf-8' })
 
     logEvent('tengu_session_memory_loaded', {
+      content_length: content.length,
+    })
+
+    return content
+  } catch (e: unknown) {
+    if (isFsInaccessible(e)) return null
+    throw e
+  }
+}
+
+/**
+ * Get the current precomputed compact-draft content. Shares the same
+ * lastSummarizedMessageId cursor as session memory — both files are
+ * updated by the same background extraction call.
+ */
+export async function getPrecomputedCompactDraftContent(): Promise<
+  string | null
+> {
+  const fs = getFsImplementation()
+  const draftPath = getPrecomputedCompactDraftPath()
+
+  try {
+    const content = await fs.readFile(draftPath, { encoding: 'utf-8' })
+
+    logEvent('tengu_compact_draft_loaded', {
       content_length: content.length,
     })
 
