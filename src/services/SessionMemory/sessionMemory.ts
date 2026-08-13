@@ -72,6 +72,7 @@ import {
 // on GrowthBook initialization. Values may be stale but are updated in background.
 
 import { errorMessage, getErrnoCode } from '../../utils/errors.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
 import {
   getDynamicConfig_CACHED_MAY_BE_STALE,
   getFeatureValue_CACHED_MAY_BE_STALE,
@@ -80,8 +81,20 @@ import {
 /**
  * Check if session memory feature is enabled.
  * Uses cached gate value - returns immediately without blocking.
+ *
+ * The GrowthBook gate has no env override upstream, which means extraction
+ * silently never runs on machines that aren't in the rollout - there's no
+ * way to opt in locally. ENABLE_CLAUDE_CODE_SESSION_MEMORY lets local/eval
+ * runs force it on regardless of remote config, mirroring the
+ * ENABLE_CLAUDE_CODE_SM_COMPACT override on the compaction-consumption side.
  */
 function isSessionMemoryGateEnabled(): boolean {
+  if (isEnvTruthy(process.env.ENABLE_CLAUDE_CODE_SESSION_MEMORY)) {
+    return true
+  }
+  if (isEnvTruthy(process.env.DISABLE_CLAUDE_CODE_SESSION_MEMORY)) {
+    return false
+  }
   return getFeatureValue_CACHED_MAY_BE_STALE('tengu_session_memory', false)
 }
 
