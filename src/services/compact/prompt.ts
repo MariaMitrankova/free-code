@@ -16,7 +16,7 @@ const proactiveModule =
 // no text output → falls through to the streaming fallback (2.79% on 4.6 vs
 // 0.01% on 4.5). Putting this FIRST and making it explicit about rejection
 // consequences prevents the wasted turn.
-const NO_TOOLS_PREAMBLE = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+export const NO_TOOLS_PREAMBLE = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
 - You already have all the context you need in the conversation above.
@@ -266,7 +266,7 @@ Here's an example of how your output should be structured:
 Please provide your summary following this structure, ensuring precision and thoroughness in your response.
 `
 
-const NO_TOOLS_TRAILER =
+export const NO_TOOLS_TRAILER =
   '\n\nREMINDER: Do NOT call any tools. Respond with plain text only — ' +
   'an <analysis> block followed by a <summary> block. ' +
   'Tool calls will be rejected and you will fail the task.'

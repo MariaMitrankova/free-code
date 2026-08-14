@@ -83,6 +83,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getTaskOutputPath } from '../../utils/task/diskOutput.js'
 import {
+  getTokenCountFromUsage,
   getTokenUsage,
   tokenCountFromLastAPIResponse,
   tokenCountWithEstimation,
@@ -113,6 +114,11 @@ import {
   roughTokenCountEstimationForMessages,
 } from '../tokenEstimation.js'
 import { groupMessagesByApiRound } from './grouping.js'
+import {
+  generateCompactSummaryParallel,
+  PARALLEL_COMPACT_BLOCK_SIZE_TOKENS,
+  shouldUseParallelCompaction,
+} from './parallelCompact.js'
 import {
   getCompactPrompt,
   getCompactUserSummaryMessage,
@@ -381,6 +387,42 @@ export function mergeHookInstructions(
 }
 
 /**
+ * Sums usage across multiple AssistantMessage responses. Called with a
+ * single response for the sequential compaction path (no-op passthrough)
+ * and with N responses for the parallel path (parallelCompact.ts), where it
+ * aggregates real cost across the N concurrent block requests into one
+ * Usage-shaped total.
+ */
+function sumUsages(
+  usages: ReturnType<typeof getTokenUsage>[],
+): ReturnType<typeof getTokenUsage> {
+  const defined = usages.filter(
+    (u): u is NonNullable<typeof u> => u !== undefined,
+  )
+  if (defined.length === 0) return undefined
+  if (defined.length === 1) return defined[0]
+
+  return {
+    input_tokens: defined.reduce((sum, u) => sum + u.input_tokens, 0),
+    output_tokens: defined.reduce((sum, u) => sum + u.output_tokens, 0),
+    cache_creation_input_tokens: defined.reduce(
+      (sum, u) => sum + (u.cache_creation_input_tokens ?? 0),
+      0,
+    ),
+    cache_read_input_tokens: defined.reduce(
+      (sum, u) => sum + (u.cache_read_input_tokens ?? 0),
+      0,
+    ),
+    cache_creation: null,
+    inference_geo: null,
+    iterations: null,
+    server_tool_use: null,
+    service_tier: defined[0].service_tier,
+    speed: defined[0].speed,
+  }
+}
+
+/**
  * Creates a compact version of a conversation by summarizing older messages
  * and preserving recent conversation history.
  */
@@ -437,62 +479,85 @@ export async function compactConversation(
       true,
     )
 
-    const compactPrompt = getCompactPrompt(customInstructions)
-    const summaryRequest = createUserMessage({
-      content: compactPrompt,
-    })
-
-    let messagesToSummarize = messages
-    let retryCacheSafeParams = cacheSafeParams
-    let summaryResponse: AssistantMessage
+    // summaryResponses always ends up with >=1 AssistantMessage regardless
+    // of which strategy ran — the parallel path's N per-block responses, or
+    // the sequential path's single (post-PTL-retry) response — so usage
+    // aggregation below (sumUsages) works identically for both.
     let summary: string | null
-    let ptlAttempts = 0
-    for (;;) {
-      summaryResponse = await streamCompactSummary({
-        messages: messagesToSummarize,
-        summaryRequest,
-        appState,
-        context,
-        preCompactTokenCount,
-        cacheSafeParams: retryCacheSafeParams,
-      })
-      summary = getAssistantMessageText(summaryResponse)
-      if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+    let summaryResponses: AssistantMessage[]
+    const usingParallelCompaction = shouldUseParallelCompaction()
 
-      // CC-1180: compact request itself hit prompt-too-long. Truncate the
-      // oldest API-round groups and retry rather than leaving the user stuck.
-      ptlAttempts++
-      const truncated =
-        ptlAttempts <= MAX_PTL_RETRIES
-          ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
-          : null
-      if (!truncated) {
-        logEvent('tengu_compact_failed', {
-          reason:
-            'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-          preCompactTokenCount,
-          promptCacheSharingEnabled,
-          ptlAttempts,
-        })
-        throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
-      }
-      logEvent('tengu_compact_ptl_retry', {
-        attempt: ptlAttempts,
-        droppedMessages: messagesToSummarize.length - truncated.length,
-        remainingMessages: truncated.length,
+    if (usingParallelCompaction) {
+      const parallelResult = await generateCompactSummaryParallel(
+        messages,
+        context,
+        cacheSafeParams,
+        customInstructions,
+      )
+      summary = parallelResult.summary
+      summaryResponses = parallelResult.responses
+      logEvent('tengu_compact_parallel', {
+        preCompactTokenCount,
+        blockCount: parallelResult.blockCount,
+        blockSizeTokens: PARALLEL_COMPACT_BLOCK_SIZE_TOKENS,
       })
-      messagesToSummarize = truncated
-      // The forked-agent path reads from cacheSafeParams.forkContextMessages,
-      // not the messages param — thread the truncated set through both paths.
-      retryCacheSafeParams = {
-        ...retryCacheSafeParams,
-        forkContextMessages: truncated,
+    } else {
+      const compactPrompt = getCompactPrompt(customInstructions)
+      const summaryRequest = createUserMessage({
+        content: compactPrompt,
+      })
+      let messagesToSummarize = messages
+      let retryCacheSafeParams = cacheSafeParams
+      let summaryResponse: AssistantMessage
+      let ptlAttempts = 0
+      for (;;) {
+        summaryResponse = await streamCompactSummary({
+          messages: messagesToSummarize,
+          summaryRequest,
+          appState,
+          context,
+          preCompactTokenCount,
+          cacheSafeParams: retryCacheSafeParams,
+        })
+        summary = getAssistantMessageText(summaryResponse)
+        if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+
+        // CC-1180: compact request itself hit prompt-too-long. Truncate the
+        // oldest API-round groups and retry rather than leaving the user stuck.
+        ptlAttempts++
+        const truncated =
+          ptlAttempts <= MAX_PTL_RETRIES
+            ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
+            : null
+        if (!truncated) {
+          logEvent('tengu_compact_failed', {
+            reason:
+              'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            preCompactTokenCount,
+            promptCacheSharingEnabled,
+            ptlAttempts,
+          })
+          throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+        }
+        logEvent('tengu_compact_ptl_retry', {
+          attempt: ptlAttempts,
+          droppedMessages: messagesToSummarize.length - truncated.length,
+          remainingMessages: truncated.length,
+        })
+        messagesToSummarize = truncated
+        // The forked-agent path reads from cacheSafeParams.forkContextMessages,
+        // not the messages param — thread the truncated set through both paths.
+        retryCacheSafeParams = {
+          ...retryCacheSafeParams,
+          forkContextMessages: truncated,
+        }
       }
+      summaryResponses = [summaryResponse]
     }
 
     if (!summary) {
       logForDebugging(
-        `Compact failed: no summary text in response. Response: ${jsonStringify(summaryResponse)}`,
+        `Compact failed: no summary text in response. usingParallelCompaction=${usingParallelCompaction}`,
         { level: 'error' },
       )
       logEvent('tengu_compact_failed', {
@@ -623,13 +688,6 @@ export async function compactConversation(
       }),
     ]
 
-    // Previously "postCompactTokenCount" — renamed because this is the
-    // compact API call's total usage (input_tokens ≈ preCompactTokenCount),
-    // NOT the size of the resulting context. Kept for event-field continuity.
-    const compactionCallTotalTokens = tokenCountFromLastAPIResponse([
-      summaryResponse,
-    ])
-
     // Message-payload estimate of the resulting context. The next iteration's
     // shouldAutoCompact will see this PLUS ~20-40K for system prompt + tools +
     // userContext (via API usage.input_tokens). So `willRetriggerNextTurn: true`
@@ -641,8 +699,17 @@ export async function compactConversation(
       ...hookMessages,
     ])
 
-    // Extract compaction API usage metrics
-    const compactionUsage = getTokenUsage(summaryResponse)
+    // Extract compaction API usage metrics. summaryResponses is length 1 for
+    // the sequential path (sumUsages of one response is a no-op passthrough)
+    // and length N for the parallel path, where this sums real cost across
+    // all N concurrent block requests.
+    const compactionUsage = sumUsages(summaryResponses.map(getTokenUsage))
+    // Previously "postCompactTokenCount" — renamed because this is the
+    // compact API call's total usage (input_tokens ≈ preCompactTokenCount),
+    // NOT the size of the resulting context. Kept for event-field continuity.
+    const compactionCallTotalTokens = compactionUsage
+      ? getTokenCountFromUsage(compactionUsage)
+      : 0
 
     const querySourceForEvent =
       recompactionInfo?.querySource ?? context.options.querySource ?? 'unknown'
@@ -657,6 +724,12 @@ export async function compactConversation(
         recompactionInfo !== undefined &&
         truePostCompactTokenCount >= recompactionInfo.autoCompactThreshold,
       isAutoCompact,
+      compactionStrategy: (usingParallelCompaction
+        ? 'parallel'
+        : 'sequential') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      parallelBlockCount: usingParallelCompaction
+        ? summaryResponses.length
+        : undefined,
       querySource:
         querySourceForEvent as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       queryChainId: (context.queryTracking?.chainId ??
