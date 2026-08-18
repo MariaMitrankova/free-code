@@ -1476,6 +1476,28 @@ export function REPL({
   const visibleStreamingText = streamingText && showStreamingText ? streamingText.substring(0, streamingText.lastIndexOf('\n') + 1) || null : null;
   const [lastQueryCompletionTime, setLastQueryCompletionTime] = useState(0);
   const [spinnerMessage, setSpinnerMessage] = useState<string | null>(null);
+  // Live "Compacting conversation (12s)" ticker. Compaction is a single
+  // long API call (or N concurrent ones on the parallel path) with no
+  // streaming output, so the spinner would otherwise sit motionless with
+  // no indication of how long it has been going.
+  const compactTimerRef = useRef<{
+    startedAt: number;
+    interval: ReturnType<typeof setInterval>;
+  } | null>(null);
+  const stopCompactTimer = useCallback((): number | null => {
+    const timer = compactTimerRef.current;
+    if (!timer) return null;
+    clearInterval(timer.interval);
+    compactTimerRef.current = null;
+    return Date.now() - timer.startedAt;
+  }, []);
+  // Safety net: clear the interval if the REPL unmounts mid-compaction.
+  useEffect(() => () => {
+    if (compactTimerRef.current) {
+      clearInterval(compactTimerRef.current.interval);
+      compactTimerRef.current = null;
+    }
+  }, []);
   const [spinnerColor, setSpinnerColor] = useState<keyof Theme | null>(null);
   const [spinnerShimmerColor, setSpinnerShimmerColor] = useState<keyof Theme | null>(null);
   const [isMessageSelectorVisible, setIsMessageSelectorVisible] = useState(false);
@@ -1578,6 +1600,9 @@ export function REPL({
     apiMetricsRef.current = [];
     setStreamingText(null);
     setStreamingToolUses([]);
+    // Turn is over — if compaction was aborted before compact_end fired,
+    // the ticker interval would otherwise keep running.
+    stopCompactTimer();
     setSpinnerMessage(null);
     setSpinnerColor(null);
     setSpinnerShimmerColor(null);
@@ -1587,7 +1612,7 @@ export function REPL({
     // turn's commands — clear after each turn to avoid accumulating
     // Promise chains for unconsumed checks (denied/aborted paths).
     clearSpeculativeChecks();
-  }, [pickNewSpinnerTip]);
+  }, [pickNewSpinnerTip, stopCompactTimer]);
 
   // Session backgrounding — hook is below, after getToolUseContext
 
@@ -2505,9 +2530,29 @@ export function REPL({
             setSpinnerMessage(event.hookType === 'pre_compact' ? 'Running PreCompact hooks\u2026' : event.hookType === 'post_compact' ? 'Running PostCompact hooks\u2026' : 'Running SessionStart hooks\u2026');
             break;
           case 'compact_start':
-            setSpinnerMessage('Compacting conversation');
+            {
+              stopCompactTimer(); // defensive: never leak a prior interval
+              setSpinnerMessage('Compacting conversation');
+              const startedAt = Date.now();
+              const interval = setInterval(() => {
+                const seconds = Math.floor((Date.now() - startedAt) / 1000);
+                setSpinnerMessage(`Compacting conversation (${seconds}s)`);
+              }, 1000);
+              // Don't hold the event loop open on exit mid-compaction.
+              interval.unref?.();
+              compactTimerRef.current = {
+                startedAt,
+                interval
+              };
+            }
             break;
           case 'compact_end':
+            {
+              const elapsedMs = stopCompactTimer();
+              if (elapsedMs !== null) {
+                logForDebugging(`Compaction finished in ${(elapsedMs / 1000).toFixed(1)}s`);
+              }
+            }
             setSpinnerMessage(null);
             setSpinnerColor(null);
             setSpinnerShimmerColor(null);
@@ -2523,7 +2568,7 @@ export function REPL({
       requestPrompt: feature('HOOK_PROMPTS') ? requestPrompt : undefined,
       contentReplacementState: contentReplacementStateRef.current
     };
-  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId]);
+  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId, stopCompactTimer]);
 
   // Session backgrounding (Ctrl+B to background/foreground)
   const handleBackgroundQuery = useCallback(() => {

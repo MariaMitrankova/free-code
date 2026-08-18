@@ -435,11 +435,16 @@ export async function compactConversation(
   isAutoCompact: boolean = false,
   recompactionInfo?: RecompactionInfo,
 ): Promise<CompactionResult> {
+  // Declared outside the try so the finally block can report duration even
+  // when compaction fails or is aborted — a failed 40s compaction is
+  // exactly the case worth seeing in the log.
+  let compactStartedAt = Date.now()
   try {
     if (messages.length === 0) {
       throw new Error(ERROR_MESSAGE_NOT_ENOUGH_MESSAGES)
     }
 
+    compactStartedAt = Date.now()
     const preCompactTokenCount = tokenCountWithEstimation(messages)
 
     const appState = context.getAppState()
@@ -486,6 +491,7 @@ export async function compactConversation(
     let summary: string | null
     let summaryResponses: AssistantMessage[]
     const usingParallelCompaction = shouldUseParallelCompaction()
+    const summarizationStartedAt = Date.now()
 
     if (usingParallelCompaction) {
       const parallelResult = await generateCompactSummaryParallel(
@@ -554,6 +560,16 @@ export async function compactConversation(
       }
       summaryResponses = [summaryResponse]
     }
+
+    // The summarization API call(s) — the part parallel compaction actually
+    // changes. Logged separately from the end-to-end duration below, which
+    // also includes hooks, attachment rebuilding, and file restoration.
+    const summarizationDurationMs = Date.now() - summarizationStartedAt
+    logForDebugging(
+      `[compact] ${usingParallelCompaction ? 'parallel' : 'sequential'} summarization took ` +
+        `${(summarizationDurationMs / 1000).toFixed(2)}s ` +
+        `(${preCompactTokenCount} tokens in, ${summaryResponses.length} API response(s))`,
+    )
 
     if (!summary) {
       logForDebugging(
@@ -730,6 +746,10 @@ export async function compactConversation(
       parallelBlockCount: usingParallelCompaction
         ? summaryResponses.length
         : undefined,
+      // Wall-clock timings — the headline numbers for comparing the two
+      // strategies. summarizationDurationMs is the apples-to-apples one.
+      summarizationDurationMs,
+      compactionDurationMs: Date.now() - compactStartedAt,
       querySource:
         querySourceForEvent as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       queryChainId: (context.queryTracking?.chainId ??
@@ -826,8 +846,16 @@ export async function compactConversation(
     if (!isAutoCompact) {
       addErrorNotificationIfNeeded(error, context)
     }
+    logForDebugging(
+      `[compact] failed after ${((Date.now() - compactStartedAt) / 1000).toFixed(2)}s`,
+      { level: 'error' },
+    )
     throw error
   } finally {
+    logForDebugging(
+      `[compact] total ${isAutoCompact ? 'auto' : 'manual'} compaction wall time: ` +
+        `${((Date.now() - compactStartedAt) / 1000).toFixed(2)}s`,
+    )
     context.setStreamMode?.('requesting')
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_end' })

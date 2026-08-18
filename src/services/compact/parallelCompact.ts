@@ -31,6 +31,7 @@
 
 import type { ToolUseContext } from '../../Tool.js'
 import type { AssistantMessage, Message, UserMessage } from '../../types/message.js'
+import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import {
   type CacheSafeParams,
@@ -41,6 +42,7 @@ import {
   getAssistantMessageText,
   getLastAssistantMessage,
 } from '../../utils/messages.js'
+import { logEvent } from '../analytics/index.js'
 import { PROMPT_TOO_LONG_ERROR_MESSAGE, startsWithApiErrorPrefix } from '../api/errors.js'
 import { roughTokenCountEstimationForMessages } from '../tokenEstimation.js'
 import { groupMessagesByApiRound } from './grouping.js'
@@ -144,6 +146,8 @@ export type ParallelBlockResult = {
   blockIndex: number
   summary: string
   response: AssistantMessage
+  /** Wall-clock time for this block's dispatch, for speedup measurement. */
+  durationMs: number
 }
 
 async function dispatchBlockSummary(
@@ -162,6 +166,7 @@ async function dispatchBlockSummary(
     ),
   })
 
+  const blockStartedAt = Date.now()
   const result = await runForkedAgent({
     promptMessages: [summaryRequest],
     cacheSafeParams: { ...cacheSafeParams, forkContextMessages },
@@ -180,8 +185,15 @@ async function dispatchBlockSummary(
     overrides: { abortController: context.abortController },
   })
 
+  const durationMs = Date.now() - blockStartedAt
   const response = getLastAssistantMessage(result.messages)
   const summary = response ? getAssistantMessageText(response) : null
+
+  logForDebugging(
+    `[parallel-compact] block ${blockIndex + 1}/${blocks.length} finished in ${(durationMs / 1000).toFixed(2)}s ` +
+      `(input=${result.totalUsage.input_tokens} output=${result.totalUsage.output_tokens} ` +
+      `cacheRead=${result.totalUsage.cache_read_input_tokens} cacheCreate=${result.totalUsage.cache_creation_input_tokens})`,
+  )
 
   if (!response || !summary || response.isApiErrorMessage) {
     throw new Error(
@@ -202,7 +214,7 @@ async function dispatchBlockSummary(
     )
   }
 
-  return { blockIndex, summary, response }
+  return { blockIndex, summary, response, durationMs }
 }
 
 /**
@@ -280,7 +292,13 @@ export async function generateCompactSummaryParallel(
   cacheSafeParams: CacheSafeParams,
   customInstructions: string | undefined,
   blockSizeTokens: number = PARALLEL_COMPACT_BLOCK_SIZE_TOKENS,
-): Promise<{ summary: string; responses: AssistantMessage[]; blockCount: number }> {
+): Promise<{
+  summary: string
+  responses: AssistantMessage[]
+  blockCount: number
+  durationMs: number
+}> {
+  const startedAt = Date.now()
   const blocks = partitionMessagesIntoBlocks(messages, blockSizeTokens)
   const results = await dispatchParallelCompaction(
     blocks,
@@ -289,9 +307,34 @@ export async function generateCompactSummaryParallel(
     customInstructions,
   )
   const summary = mergeBlockSummaries(results.map(r => r.summary))
+  const durationMs = Date.now() - startedAt
+
+  // The concurrency payoff, stated directly: wall-clock time should track
+  // the SLOWEST block, not the sum of all of them. serialMs/durationMs is
+  // the speedup this path bought over dispatching the same blocks one at a
+  // time (it is NOT the speedup vs. the sequential single-call path —
+  // compare against tengu_compact's compactionDurationMs for that).
+  const perBlockMs = results.map(r => r.durationMs)
+  const serialMs = perBlockMs.reduce((sum, ms) => sum + ms, 0)
+  const criticalPathMs = Math.max(...perBlockMs, 0)
+  logForDebugging(
+    `[parallel-compact] ${blocks.length} blocks in ${(durationMs / 1000).toFixed(2)}s ` +
+      `(critical path ${(criticalPathMs / 1000).toFixed(2)}s, would be ${(serialMs / 1000).toFixed(2)}s serially — ` +
+      `${serialMs > 0 ? (serialMs / durationMs).toFixed(2) : '1.00'}x from concurrency); ` +
+      `per-block: ${perBlockMs.map(ms => (ms / 1000).toFixed(2) + 's').join(', ')}`,
+  )
+  logEvent('tengu_compact_parallel_dispatch', {
+    blockCount: blocks.length,
+    durationMs,
+    criticalPathMs,
+    serialEquivalentMs: serialMs,
+    blockSizeTokens,
+  })
+
   return {
     summary,
     responses: results.map(r => r.response),
     blockCount: blocks.length,
+    durationMs,
   }
 }
