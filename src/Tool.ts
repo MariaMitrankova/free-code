@@ -153,6 +153,11 @@ export type CompactProgressEvent =
       hookType: 'pre_compact' | 'post_compact' | 'session_start'
     }
   | { type: 'compact_start' }
+  // Parallel compaction only: N block summaries are dispatched at once, so
+  // progress is reported as blocks COMPLETE rather than as a cursor moving
+  // through them one at a time — they are all in flight simultaneously.
+  | { type: 'compact_blocks_start'; blockCount: number }
+  | { type: 'compact_block_done'; completedCount: number; blockCount: number }
   | { type: 'compact_end' }
 
 export type ToolUseContext = {

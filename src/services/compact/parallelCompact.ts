@@ -208,6 +208,7 @@ async function dispatchBlockSummary(
   cacheSafeParams: CacheSafeParams,
   context: ToolUseContext,
   customInstructions: string | undefined,
+  onBlockDone?: (durationMs: number) => void,
 ): Promise<ParallelBlockResult> {
   const forkContextMessages = buildTargetBlockForkContext(blocks, blockIndex)
   const summaryRequest: UserMessage = createUserMessage({
@@ -217,6 +218,12 @@ async function dispatchBlockSummary(
       customInstructions,
     ),
   })
+
+  logForDebugging(
+    `[parallel-compact] block ${blockIndex + 1}/${blocks.length} dispatched ` +
+      `(${roughTokenCountEstimationForMessages(blocks[blockIndex] ?? [])} tokens to summarize, ` +
+      `${roughTokenCountEstimationForMessages(forkContextMessages)} tokens of context sent)`,
+  )
 
   const blockStartedAt = Date.now()
   const result = await runForkedAgent({
@@ -240,6 +247,11 @@ async function dispatchBlockSummary(
   const durationMs = Date.now() - blockStartedAt
   const response = getLastAssistantMessage(result.messages)
   const summary = response ? getAssistantMessageText(response) : null
+
+  // Report completion before the validity checks below, so a block that
+  // returns a malformed summary still counts as "no longer in flight"
+  // rather than leaving the progress display stuck.
+  onBlockDone?.(durationMs)
 
   logForDebugging(
     `[parallel-compact] block ${blockIndex + 1}/${blocks.length} finished in ${(durationMs / 1000).toFixed(2)}s ` +
@@ -281,9 +293,32 @@ export async function dispatchParallelCompaction(
   context: ToolUseContext,
   customInstructions?: string,
 ): Promise<ParallelBlockResult[]> {
+  context.onCompactProgress?.({
+    type: 'compact_blocks_start',
+    blockCount: blocks.length,
+  })
+
+  // Progress is completion-count based, not a per-block cursor: all N
+  // requests are in flight at once, so "block 3 is running" is never a
+  // meaningful statement — only "3 of N have come back" is.
+  let completedCount = 0
   const results = await Promise.all(
     blocks.map((_, k) =>
-      dispatchBlockSummary(blocks, k, cacheSafeParams, context, customInstructions),
+      dispatchBlockSummary(
+        blocks,
+        k,
+        cacheSafeParams,
+        context,
+        customInstructions,
+        () => {
+          completedCount++
+          context.onCompactProgress?.({
+            type: 'compact_block_done',
+            completedCount,
+            blockCount: blocks.length,
+          })
+        },
+      ),
     ),
   )
   // Promise.all already preserves input order, but sort defensively in case

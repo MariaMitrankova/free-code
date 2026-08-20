@@ -360,6 +360,46 @@ describe('parallel compaction — zero-token algorithm test', () => {
     currentPerBlockOutput = PARALLEL_OUTPUT_TOKENS_PER_BLOCK
   })
 
+  test('emits block progress events as blocks complete', async () => {
+    callLog.length = 0
+    const conversation = buildConversation(12, 2_000)
+    const events: any[] = []
+
+    await parallel.generateCompactSummaryParallel(
+      conversation,
+      {
+        abortController: new AbortController(),
+        onCompactProgress: (e: any) => events.push(e),
+      } as any,
+      { forkContextMessages: conversation } as any,
+      undefined,
+      6_000,
+    )
+
+    const startEvents = events.filter(e => e.type === 'compact_blocks_start')
+    const doneEvents = events.filter(e => e.type === 'compact_block_done')
+    const n = startEvents[0]?.blockCount
+
+    console.log('\n=== PROGRESS EVENTS ===')
+    console.log(`  compact_blocks_start: blockCount=${n}`)
+    for (const e of doneEvents) {
+      console.log(`  compact_block_done: ${e.completedCount}/${e.blockCount}`)
+    }
+
+    // Exactly one start, fired before any completion.
+    expect(startEvents.length).toBe(1)
+    expect(events[0]!.type).toBe('compact_blocks_start')
+    expect(n).toBeGreaterThan(1)
+
+    // One completion per block, counting 1..N with no gaps or repeats —
+    // this is what keeps the spinner from getting stuck or double-counting.
+    expect(doneEvents.length).toBe(n)
+    expect(doneEvents.map(e => e.completedCount)).toEqual(
+      Array.from({ length: n }, (_, i) => i + 1),
+    )
+    expect(doneEvents.every(e => e.blockCount === n)).toBe(true)
+  })
+
   test('speedup is robust to the decode-rate assumption', async () => {
     const conversation = buildConversation(40, 2_500) // ~100K
     const totalTokens = roughTokenCountEstimationForMessages(conversation)

@@ -1480,9 +1480,13 @@ export function REPL({
   // long API call (or N concurrent ones on the parallel path) with no
   // streaming output, so the spinner would otherwise sit motionless with
   // no indication of how long it has been going.
+  // `label` is mutable so parallel-compaction block progress can change the
+  // text ("Compacting 4 blocks in parallel · 2/4 done") while the same
+  // elapsed-seconds timer keeps running underneath it.
   const compactTimerRef = useRef<{
     startedAt: number;
     interval: ReturnType<typeof setInterval>;
+    label: string;
   } | null>(null);
   const stopCompactTimer = useCallback((): number | null => {
     const timer = compactTimerRef.current;
@@ -1490,6 +1494,18 @@ export function REPL({
     clearInterval(timer.interval);
     compactTimerRef.current = null;
     return Date.now() - timer.startedAt;
+  }, []);
+  // Repaint the spinner immediately on a label change instead of waiting up
+  // to a second for the next tick.
+  const setCompactLabel = useCallback((label: string) => {
+    const timer = compactTimerRef.current;
+    if (!timer) {
+      setSpinnerMessage(label);
+      return;
+    }
+    timer.label = label;
+    const seconds = Math.floor((Date.now() - timer.startedAt) / 1000);
+    setSpinnerMessage(`${label} (${seconds}s)`);
   }, []);
   // Safety net: clear the interval if the REPL unmounts mid-compaction.
   useEffect(() => () => {
@@ -2536,15 +2552,23 @@ export function REPL({
               const startedAt = Date.now();
               const interval = setInterval(() => {
                 const seconds = Math.floor((Date.now() - startedAt) / 1000);
-                setSpinnerMessage(`Compacting conversation (${seconds}s)`);
+                const label = compactTimerRef.current?.label ?? 'Compacting conversation';
+                setSpinnerMessage(`${label} (${seconds}s)`);
               }, 1000);
               // Don't hold the event loop open on exit mid-compaction.
               interval.unref?.();
               compactTimerRef.current = {
                 startedAt,
-                interval
+                interval,
+                label: 'Compacting conversation'
               };
             }
+            break;
+          case 'compact_blocks_start':
+            setCompactLabel(`Compacting ${event.blockCount} block${event.blockCount === 1 ? '' : 's'} in parallel`);
+            break;
+          case 'compact_block_done':
+            setCompactLabel(`Compacting ${event.blockCount} block${event.blockCount === 1 ? '' : 's'} in parallel · ${event.completedCount}/${event.blockCount} done`);
             break;
           case 'compact_end':
             {
@@ -2568,7 +2592,7 @@ export function REPL({
       requestPrompt: feature('HOOK_PROMPTS') ? requestPrompt : undefined,
       contentReplacementState: contentReplacementStateRef.current
     };
-  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId, stopCompactTimer]);
+  }, [commands, combinedInitialTools, mainThreadAgentDefinition, debug, initialMcpClients, ideInstallationStatus, dynamicMcpConfig, theme, allowedAgentTypes, store, setAppState, reverify, addNotification, setMessages, onChangeDynamicMcpConfig, resume, requestPrompt, disabled, customSystemPrompt, appendSystemPrompt, setConversationId, stopCompactTimer, setCompactLabel]);
 
   // Session backgrounding (Ctrl+B to background/foreground)
   const handleBackgroundQuery = useCallback(() => {
