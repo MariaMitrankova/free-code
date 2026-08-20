@@ -48,15 +48,67 @@ import { roughTokenCountEstimationForMessages } from '../tokenEstimation.js'
 import { groupMessagesByApiRound } from './grouping.js'
 import { getParallelBlockCompactPrompt } from './parallelPrompt.js'
 
+function envInt(name: string, fallback: number): number {
+  const parsed = process.env[name] ? parseInt(process.env[name]!, 10) : NaN
+  return !isNaN(parsed) && parsed > 0 ? parsed : fallback
+}
+
 /**
- * B — the fixed block-size configuration knob from the paper, in tokens.
- * Overridable via PARALLEL_COMPACT_BLOCK_SIZE_TOKENS for testing/tuning.
+ * B — the block-size ceiling, in tokens. The paper treats B as a fixed knob,
+ * which works when |X| greatly exceeds B. Here the conversation handed to
+ * compaction is bounded by the auto-compact threshold, so a fixed B silently
+ * degenerates to N=1 whenever |X| <= B — the flag appears on but nothing runs
+ * in parallel. So this is a CEILING, and the effective block size is derived
+ * per-compaction by chooseBlockSize() below.
  */
-export const PARALLEL_COMPACT_BLOCK_SIZE_TOKENS = (() => {
-  const override = process.env.PARALLEL_COMPACT_BLOCK_SIZE_TOKENS
-  const parsed = override ? parseInt(override, 10) : NaN
-  return !isNaN(parsed) && parsed > 0 ? parsed : 20_000
-})()
+export const PARALLEL_COMPACT_BLOCK_SIZE_TOKENS = envInt(
+  'PARALLEL_COMPACT_BLOCK_SIZE_TOKENS',
+  20_000,
+)
+
+/** Number of blocks to aim for when the conversation is smaller than B. */
+export const PARALLEL_COMPACT_TARGET_BLOCKS = envInt(
+  'PARALLEL_COMPACT_TARGET_BLOCKS',
+  4,
+)
+
+/**
+ * Below this, parallel compaction is not worth it: each request pays the
+ * same fixed time-to-first-token, so splitting a small conversation into N
+ * tiny blocks adds per-request overhead and N-way input-token amplification
+ * to buy back almost no decode time. Under this threshold we fall back to
+ * the sequential path (see isWorthParallelizing).
+ */
+export const PARALLEL_COMPACT_MIN_TOKENS = envInt(
+  'PARALLEL_COMPACT_MIN_TOKENS',
+  8_000,
+)
+
+/**
+ * Picks the effective block size so the partition lands near
+ * PARALLEL_COMPACT_TARGET_BLOCKS, never exceeding the configured ceiling.
+ *
+ * NOTE: this only sets an upper bound on block size. The achieved N can
+ * still be lower than the target, because partitionMessagesIntoBlocks never
+ * splits an API round — a conversation made of a few huge tool results has
+ * a hard floor on block size no matter what this returns.
+ */
+export function chooseBlockSize(
+  totalTokens: number,
+  ceilingTokens: number = PARALLEL_COMPACT_BLOCK_SIZE_TOKENS,
+  targetBlocks: number = PARALLEL_COMPACT_TARGET_BLOCKS,
+): number {
+  if (totalTokens <= 0 || targetBlocks <= 1) return ceilingTokens
+  return Math.max(1, Math.min(ceilingTokens, Math.ceil(totalTokens / targetBlocks)))
+}
+
+/**
+ * Whether a conversation of this size is big enough for parallel compaction
+ * to pay for itself. Callers should fall back to sequential when false.
+ */
+export function isWorthParallelizing(totalTokens: number): boolean {
+  return totalTokens >= PARALLEL_COMPACT_MIN_TOKENS
+}
 
 /**
  * Opt-in only: this is new and unproven relative to the sequential path.
@@ -299,7 +351,28 @@ export async function generateCompactSummaryParallel(
   durationMs: number
 }> {
   const startedAt = Date.now()
-  const blocks = partitionMessagesIntoBlocks(messages, blockSizeTokens)
+  const totalTokens = roughTokenCountEstimationForMessages(messages)
+  // Derive the effective block size from the actual conversation rather than
+  // using the ceiling directly — otherwise |X| <= B silently yields N=1.
+  const effectiveBlockSize = chooseBlockSize(totalTokens, blockSizeTokens)
+  const blocks = partitionMessagesIntoBlocks(messages, effectiveBlockSize)
+
+  logForDebugging(
+    `[parallel-compact] conversation ≈${totalTokens} tokens; block size ${effectiveBlockSize} ` +
+      `(ceiling ${blockSizeTokens}, target ${PARALLEL_COMPACT_TARGET_BLOCKS} blocks) → ${blocks.length} block(s)`,
+  )
+  if (blocks.length === 1) {
+    // Degenerate: this is sequential compaction with extra steps (one worker,
+    // TARGET_BLOCK markers, merge is a passthrough) — no concurrency at all.
+    // Almost always means the conversation is dominated by one or a few large
+    // API rounds, which partitionMessagesIntoBlocks cannot split.
+    logForDebugging(
+      `[parallel-compact] WARNING: only 1 block — no parallelism. ` +
+        `The conversation (≈${totalTokens} tokens across ${groupMessagesByApiRound(messages).length} API round(s)) ` +
+        `could not be split further; rounds are indivisible, so a few huge tool results impose a hard floor.`,
+      { level: 'warn' },
+    )
+  }
   const results = await dispatchParallelCompaction(
     blocks,
     cacheSafeParams,
@@ -328,7 +401,9 @@ export async function generateCompactSummaryParallel(
     durationMs,
     criticalPathMs,
     serialEquivalentMs: serialMs,
-    blockSizeTokens,
+    blockSizeTokens: effectiveBlockSize,
+    blockSizeCeilingTokens: blockSizeTokens,
+    conversationTokens: totalTokens,
   })
 
   return {

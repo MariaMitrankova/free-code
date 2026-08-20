@@ -116,7 +116,9 @@ import {
 import { groupMessagesByApiRound } from './grouping.js'
 import {
   generateCompactSummaryParallel,
+  isWorthParallelizing,
   PARALLEL_COMPACT_BLOCK_SIZE_TOKENS,
+  PARALLEL_COMPACT_MIN_TOKENS,
   shouldUseParallelCompaction,
 } from './parallelCompact.js'
 import {
@@ -490,7 +492,19 @@ export async function compactConversation(
     // aggregation below (sumUsages) works identically for both.
     let summary: string | null
     let summaryResponses: AssistantMessage[]
-    const usingParallelCompaction = shouldUseParallelCompaction()
+    // Parallel compaction only pays off above a size floor — below it, N tiny
+    // blocks each pay full time-to-first-token and N-way input amplification
+    // to save almost no decode time. Fall back to sequential rather than
+    // silently running a degenerate 1-block "parallel" compaction.
+    const parallelRequested = shouldUseParallelCompaction()
+    const usingParallelCompaction =
+      parallelRequested && isWorthParallelizing(preCompactTokenCount)
+    if (parallelRequested && !usingParallelCompaction) {
+      logForDebugging(
+        `[compact] parallel compaction requested but conversation is only ` +
+          `${preCompactTokenCount} tokens (min ${PARALLEL_COMPACT_MIN_TOKENS}) — using sequential path instead`,
+      )
+    }
     const summarizationStartedAt = Date.now()
 
     if (usingParallelCompaction) {
