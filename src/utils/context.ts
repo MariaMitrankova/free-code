@@ -11,6 +11,41 @@ export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
 // Maximum output tokens for compact operations
 export const COMPACT_MAX_OUTPUT_TOKENS = 20_000
 
+/**
+ * Scales a token buffer that was tuned against the default 200K context
+ * window down to a smaller window, proportionally.
+ *
+ * The compaction buffers (summary reserve, autocompact buffer, warning and
+ * error thresholds) are absolute constants sized for 200K. On a small window
+ * they exceed the window itself and the derived thresholds go NEGATIVE —
+ * e.g. at 32K: 32,000 − 20,000 (summary reserve) − 13,000 (autocompact
+ * buffer) = −1,000, so `tokenUsage >= threshold` is always true and
+ * compaction fires on every turn against a nearly-empty conversation.
+ *
+ * The ratio is capped at 1, so windows at or above 200K (including 1M) keep
+ * exactly the values they have today — this only ever shrinks buffers for
+ * small windows, never grows them.
+ */
+export function scaleBufferToWindow(
+  baselineTokens: number,
+  contextWindow: number,
+): number {
+  if (contextWindow <= 0) return baselineTokens
+  const ratio = Math.min(1, contextWindow / MODEL_CONTEXT_WINDOW_DEFAULT)
+  return Math.max(1, Math.round(baselineTokens * ratio))
+}
+
+/**
+ * Per-model cap on compaction summary output, scaled to the context window.
+ *
+ * Must stay in step with the summary reserve in getEffectiveContextWindowSize:
+ * reserving 3,200 tokens for the summary while still letting the model emit
+ * up to 20,000 would overflow the window the reserve was meant to protect.
+ */
+export function getCompactMaxOutputTokens(contextWindow: number): number {
+  return scaleBufferToWindow(COMPACT_MAX_OUTPUT_TOKENS, contextWindow)
+}
+
 // Default max output tokens
 const MAX_OUTPUT_TOKENS_DEFAULT = 32_000
 const MAX_OUTPUT_TOKENS_UPPER_LIMIT = 64_000

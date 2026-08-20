@@ -9,7 +9,7 @@ const sessionTranscriptModule = feature('KAIROS')
 
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 import { markPostCompaction } from 'src/bootstrap/state.js'
-import { getInvokedSkillsForAgent } from '../../bootstrap/state.js'
+import { getInvokedSkillsForAgent, getSdkBetas } from '../../bootstrap/state.js'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Tool, ToolUseContext } from '../../Tool.js'
@@ -39,7 +39,10 @@ import {
   getMcpInstructionsDeltaAttachment,
 } from '../../utils/attachments.js'
 import { getMemoryPath } from '../../utils/config.js'
-import { COMPACT_MAX_OUTPUT_TOKENS } from '../../utils/context.js'
+import {
+  getCompactMaxOutputTokens,
+  getContextWindowForModel,
+} from '../../utils/context.js'
 import {
   analyzeContext,
   tokenStatsToStatsigMetrics,
@@ -1429,8 +1432,17 @@ async function streamCompactSummary({
           toolChoice: undefined,
           isNonInteractiveSession: context.options.isNonInteractiveSession,
           hasAppendSystemPrompt: !!context.options.appendSystemPrompt,
+          // Scaled to the context window so the summary cannot exceed the
+          // reserve getEffectiveContextWindowSize set aside for it — on a
+          // small window an unscaled 20K cap would overflow the very space
+          // the reserve exists to protect.
           maxOutputTokensOverride: Math.min(
-            COMPACT_MAX_OUTPUT_TOKENS,
+            getCompactMaxOutputTokens(
+              getContextWindowForModel(
+                context.options.mainLoopModel,
+                getSdkBetas(),
+              ),
+            ),
             getMaxOutputTokensForModel(context.options.mainLoopModel),
           ),
           querySource: 'compact',
